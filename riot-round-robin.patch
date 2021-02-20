@@ -1,0 +1,324 @@
+diff --git a/core/include/sched.h b/core/include/sched.h
+index f37092cc4..df2cb7c31 100644
+--- a/core/include/sched.h
++++ b/core/include/sched.h
+@@ -90,6 +90,8 @@
+ extern "C" {
+ #endif
+ 
++extern clist_node_t list_all_threads;
++
+ /**
+  * @brief forward declaration for thread_t, defined in thread.h
+  */
+diff --git a/core/include/thread.h b/core/include/thread.h
+index e3dc3ef8d..f437fcdbc 100644
+--- a/core/include/thread.h
++++ b/core/include/thread.h
+@@ -145,7 +145,8 @@ struct _thread {
+     char *sp;                       /**< thread's stack pointer         */
+     thread_status_t status;         /**< thread's status                */
+     uint8_t priority;               /**< thread's priority              */
+-
++    uint64_t max_service_time;      /**< thread's max total time        */
++    uint64_t service_time;          /**< thread's total run time        */
+     kernel_pid_t pid;               /**< thread's process id            */
+ 
+ #if defined(MODULE_CORE_THREAD_FLAGS) || defined(DOXYGEN)
+diff --git a/core/sched.c b/core/sched.c
+index 011171861..0c77b1e25 100644
+--- a/core/sched.c
++++ b/core/sched.c
+@@ -27,6 +27,8 @@
+ #include "irq.h"
+ #include "thread.h"
+ #include "log.h"
++#include "xtimer.h"
++#include "stdbool.h"
+ 
+ #ifdef MODULE_MPU_STACK_GUARD
+ #include "mpu.h"
+@@ -42,6 +44,8 @@
+ 
+ volatile int sched_num_threads = 0;
+ 
++bool isIdle = false;
++
+ volatile unsigned int sched_context_switch_request;
+ 
+ volatile thread_t *sched_threads[KERNEL_PID_LAST + 1];
+@@ -50,7 +54,15 @@ volatile thread_t *sched_active_thread;
+ volatile kernel_pid_t sched_active_pid = KERNEL_PID_UNDEF;
+ 
+ clist_node_t sched_runqueues[SCHED_PRIO_LEVELS];
+-static uint32_t runqueue_bitcache = 0;
++//static uint32_t runqueue_bitcache = 0;
++
++clist_node_t list_all_threads;
++
++/* xtimer for scheduling and service time calculations */
++void sched_switch_callback (void *arg);
++xtimer_t timer_rr = {NULL, 0, 0, 0, 0, sched_switch_callback, NULL};
++#define ROUND_ROBIN_TIME_QUANTUM 500000 // in microseconds
++uint64_t service_time_start = 0; // time when current thread woke up
+ 
+ /* Needed by OpenOCD to read sched_threads */
+ #if defined(__APPLE__) && defined(__MACH__)
+@@ -101,34 +113,43 @@ int __attribute__((used)) sched_run(void)
+ {
+     sched_context_switch_request = 0;
+     thread_t *active_thread = (thread_t *)sched_active_thread;
++    thread_t *next_thread = NULL;
+ 
+     if (!IS_USED(MODULE_CORE_IDLE_THREAD)) {
+-        if (!runqueue_bitcache) {
++        if (clist_count(&list_all_threads) == 1) {
+             if (active_thread) {
+                 _unschedule(active_thread);
+                 active_thread = NULL;
+             }
+ 
+-            while (!runqueue_bitcache) {
++            while (clist_count(&list_all_threads) == 1) {
+                 sched_arch_idle();
+             }
+         }
+     }
+ 
+-    int nextrq = bitarithm_lsb(runqueue_bitcache);
+-    thread_t *next_thread = container_of(sched_runqueues[nextrq].next->next,
+-                                         thread_t, rq_entry);
++    // Thread selection
++    if (active_thread) {
++      if (clist_count(&list_all_threads) == 1) {
++        next_thread = active_thread;
++      } else {
++        next_thread = container_of((&active_thread->rq_entry)->next,
++                                           thread_t, rq_entry);
++      }
++    } else {
++      // Only accept threads in PENDING state
++      next_thread = container_of((list_all_threads.next)->next, thread_t, rq_entry);
++    }
+ 
+-    DEBUG(
+-        "sched_run: active thread: %" PRIkernel_pid ", next thread: %" PRIkernel_pid "\n",
+-        (kernel_pid_t)((active_thread == NULL)
+-                       ? KERNEL_PID_UNDEF
+-                       : active_thread->pid),
+-        next_thread->pid);
++    // Only accept threads in PENDING state
++    if (clist_count(&list_all_threads) > 1) {
++      while (next_thread->status != STATUS_PENDING || next_thread->priority == 15) {
++        next_thread = container_of((&next_thread->rq_entry)->next,
++                                           thread_t, rq_entry);
+ 
+-    if (active_thread == next_thread) {
+-        DEBUG("sched_run: done, sched_active_thread was not changed.\n");
+-        return 0;
++        if (next_thread->status == STATUS_RUNNING)
++          break;
++      }
+     }
+ 
+     if (active_thread) {
+@@ -142,9 +163,40 @@ int __attribute__((used)) sched_run(void)
+ #endif
+ 
+     next_thread->status = STATUS_RUNNING;
++
++    if (service_time_start != 0) {
++      next_thread->service_time += xtimer_now64().ticks64 - service_time_start;
++    }
++
++    if (next_thread->priority != 7) {  // if NOT main thread
++      service_time_start = xtimer_now64().ticks64;
++    }
++
+     sched_active_pid = next_thread->pid;
+     sched_active_thread = (volatile thread_t *)next_thread;
+ 
++    #ifdef DEVELHELP
++      if(!isIdle) {
++        printf("\nThread Name: %s\n", sched_active_thread->name);
++      }
++
++      if(next_thread->priority == 15) {
++        isIdle = true;
++      } else {
++        isIdle = false;
++      }
++    #endif
++
++    if(next_thread->max_service_time != 0) {
++      if (next_thread->max_service_time > next_thread->service_time) {
++        // Avoid overflow from subtracting unsigned numbers
++        float time = (float) ((next_thread->max_service_time - next_thread->service_time));
++        printf("Thread service time remaining: %.2fs\n", (float) time / 1000000);
++      } else {
++        printf("Thread service time remaining: 0.00s\n");
++      }
++    }
++
+ #ifdef MODULE_MPU_STACK_GUARD
+     mpu_configure(
+         2,                                                  /* MPU region 2 */
+@@ -157,61 +209,26 @@ int __attribute__((used)) sched_run(void)
+ 
+     DEBUG("sched_run: done, changed sched_active_thread.\n");
+ 
++    xtimer_set(&timer_rr, ROUND_ROBIN_TIME_QUANTUM);
++
+     return 1;
+ }
+ 
+ void sched_set_status(thread_t *process, thread_status_t status)
+ {
+-    if (status >= STATUS_ON_RUNQUEUE) {
+-        if (!(process->status >= STATUS_ON_RUNQUEUE)) {
+-            DEBUG(
+-                "sched_set_status: adding thread %" PRIkernel_pid " to runqueue %" PRIu8 ".\n",
+-                process->pid, process->priority);
+-            clist_rpush(&sched_runqueues[process->priority],
+-                        &(process->rq_entry));
+-            runqueue_bitcache |= 1 << process->priority;
+-        }
+-    }
+-    else {
+-        if (process->status >= STATUS_ON_RUNQUEUE) {
+-            DEBUG(
+-                "sched_set_status: removing thread %" PRIkernel_pid " from runqueue %" PRIu8 ".\n",
+-                process->pid, process->priority);
+-            clist_lpop(&sched_runqueues[process->priority]);
+-
+-            if (!sched_runqueues[process->priority].next) {
+-                runqueue_bitcache &= ~(1 << process->priority);
+-            }
+-        }
+-    }
+-
+     process->status = status;
+ }
+ 
++void sched_switch_callback (void *arg)
++{
++  (void) arg;
++  sched_switch(1);
++}
++
+ void sched_switch(uint16_t other_prio)
+ {
+-    thread_t *active_thread = (thread_t *)sched_active_thread;
+-    uint16_t current_prio = active_thread->priority;
+-    int on_runqueue = (active_thread->status >= STATUS_ON_RUNQUEUE);
+-
+-    DEBUG("sched_switch: active pid=%" PRIkernel_pid " prio=%" PRIu16 " on_runqueue=%i "
+-          ", other_prio=%" PRIu16 "\n",
+-          active_thread->pid, current_prio, on_runqueue,
+-          other_prio);
+-
+-    if (!on_runqueue || (current_prio > other_prio)) {
+-        if (irq_is_in()) {
+-            DEBUG("sched_switch: setting sched_context_switch_request.\n");
+-            sched_context_switch_request = 1;
+-        }
+-        else {
+-            DEBUG("sched_switch: yielding immediately.\n");
+-            thread_yield_higher();
+-        }
+-    }
+-    else {
+-        DEBUG("sched_switch: continuing without yield.\n");
+-    }
++    (void)other_prio;
++    sched_context_switch_request = 1;
+ }
+ 
+ NORETURN void sched_task_exit(void)
+@@ -224,6 +241,7 @@ NORETURN void sched_task_exit(void)
+     sched_num_threads--;
+ 
+     sched_set_status((thread_t *)sched_active_thread, STATUS_STOPPED);
++    clist_remove(&list_all_threads, &(((thread_t *)sched_active_thread)->rq_entry));
+ 
+     sched_active_thread = NULL;
+     cpu_switch_context_exit();
+diff --git a/core/thread.c b/core/thread.c
+index 48bd2debb..af54b943b 100644
+--- a/core/thread.c
++++ b/core/thread.c
+@@ -30,6 +30,8 @@
+ #include "bitarithm.h"
+ #include "sched.h"
+ 
++// clist_node_t list_all_threads;
++
+ volatile thread_t *thread_get(kernel_pid_t pid)
+ {
+     if (pid_is_valid(pid)) {
+@@ -142,15 +144,16 @@ int thread_wakeup(kernel_pid_t pid)
+ 
+ void thread_yield(void)
+ {
+-    unsigned old_state = irq_disable();
+-    thread_t *me = (thread_t *)sched_active_thread;
++  unsigned int old_state = irq_disable();
++  thread_t *me = (thread_t *) sched_active_thread;
+ 
+-    if (me->status >= STATUS_ON_RUNQUEUE) {
+-        clist_lpoprpush(&sched_runqueues[me->priority]);
+-    }
+-    irq_restore(old_state);
++  if (me->status >= STATUS_ON_RUNQUEUE) {
++    clist_lpoprpush(&list_all_threads);
++  }
+ 
+-    thread_yield_higher();
++  irq_restore(old_state);
++
++  thread_yield_higher();
+ }
+ 
+ void thread_add_to_list(list_node_t *list, thread_t *thread)
+@@ -274,6 +277,7 @@ kernel_pid_t thread_create(char *stack, int stacksize, uint8_t priority,
+ 
+     thread->priority = priority;
+     thread->status = STATUS_STOPPED;
++    thread->service_time = 0;
+ 
+     thread->rq_entry.next = NULL;
+ 
+@@ -284,6 +288,8 @@ kernel_pid_t thread_create(char *stack, int stacksize, uint8_t priority,
+     thread->msg_array = NULL;
+ #endif
+ 
++    clist_rpush(&list_all_threads, &(thread->rq_entry));
++
+     sched_num_threads++;
+ 
+     DEBUG("Created thread %s. PID: %" PRIkernel_pid ". Priority: %u.\n", name,
+diff --git a/examples/hello-world/Makefile b/examples/hello-world/Makefile
+index 258d8e9ba..c8c1b3806 100644
+--- a/examples/hello-world/Makefile
++++ b/examples/hello-world/Makefile
+@@ -15,4 +15,7 @@ DEVELHELP ?= 1
+ # Change this to 0 show compiler invocation lines by default:
+ QUIET ?= 1
+ 
++
++USEMOUDLE += xtimer
++
+ include $(RIOTBASE)/Makefile.include
+diff --git a/examples/ipc_pingpong/main.c b/examples/ipc_pingpong/main.c
+index 655ff39a7..7670f44a2 100644
+--- a/examples/ipc_pingpong/main.c
++++ b/examples/ipc_pingpong/main.c
+@@ -50,7 +50,7 @@ int main(void)
+ 
+     msg_t m;
+ 
+-    kernel_pid_t pid = thread_create(second_thread_stack, sizeof(second_thread_stack),
++    kernel_pid_t pid =  thread_create(second_thread_stack, sizeof(second_thread_stack),
+                             THREAD_PRIORITY_MAIN - 1, THREAD_CREATE_STACKTEST,
+                             second_thread, NULL, "pong");
+ 
