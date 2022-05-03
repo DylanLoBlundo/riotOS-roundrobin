@@ -1,8 +1,6 @@
 Leonardi, Thanaphon, 4633433
 Lo Blundo, Dylan, 4623731
 
-## How to run
-
 Running the RRTester application:
 1. Ensure the Makefile includes the xtimer library
 2. In the RRTester directory, run "make all term"
